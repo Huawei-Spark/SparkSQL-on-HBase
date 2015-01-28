@@ -54,6 +54,7 @@ class HBaseSource extends RelationProvider {
     val nonKeyCols = parameters("nonKeyCols").split(";")
       .filterNot(_ == "")
       .map { case c => val cols = c.split(","); (cols(0), cols(1), cols(2), cols(3))}
+    val splitFile = parameters("splitFileName")
 
     val keyMap: Map[String, String] = keyCols.toMap
     val allColumns = colsSeq.map {
@@ -73,8 +74,27 @@ class HBaseSource extends RelationProvider {
           )
         }
     }
-    catalog.createTable(tableName, rawNamespace, hbaseTable, allColumns, null)
+    val keyColumns = allColumns.filter(_.isInstanceOf[KeyColumn])
+    val splits = createSplitKeys(sqlContext, keyColumns, splitFile)
+    catalog.createTable(tableName, rawNamespace, hbaseTable, allColumns, splits)
   }
+
+  private[hbase] def createSplitKeys(
+      sqlContext: SQLContext,
+      keyColumns: Seq[AbstractColumn],
+      splitFile: String): Array[Array[Byte]] = {
+    val rdd = sqlContext.sparkContext.textFile(splitFile)
+    rdd.map {line =>
+      val buffer = keyColumns.map { x =>
+	    BytesUtils.create(x.dataType)
+	  }
+      val keyBytes = new Array[(Array[Byte], DataType)](keyColumns.size)
+      //TODO: delimiter needs to make as configurable
+       HBaseKVHelper.string2Key(line.split(","), buffer.toArray, keyColumns, keyBytes)
+       HBaseKVHelper.encodingRawKeyColumns(keyBytes).asInstanceOf[Array[Byte]]
+    }.collect
+  }
+
 }
 
 /**

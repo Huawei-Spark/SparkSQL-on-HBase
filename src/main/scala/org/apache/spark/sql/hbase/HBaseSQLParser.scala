@@ -61,6 +61,7 @@ class HBaseSQLParser extends SqlParser {
   protected val PARALL = Keyword("PARALL")
   protected val SHORT = Keyword("SHORT")
   protected val SHOW = Keyword("SHOW")
+  protected val SPLITSFILE = Keyword("SPLITSFILE")
   protected val TABLES = Keyword("TABLES")
   protected val VALUES = Keyword("VALUES")
   protected val TERMINATED = Keyword("TERMINATED")
@@ -96,9 +97,11 @@ class HBaseSQLParser extends SqlParser {
       (PRIMARY ~> KEY ~> "(" ~> keys <~ ")" <~ ")") ~
       (MAPPED ~> BY ~> "(" ~> opt(nameSpace)) ~
       (ident <~ ",") ~
-      (COLS ~> "=" ~> "[" ~> expressions <~ "]" <~ ")") <~ opt(";") ^^ {
+      (COLS ~> "=" ~> "[" ~> expressions <~ "]" <~ ")") ~
+      opt(SPLITSFILE ~> "=" ~> literal) <~ opt(";") ^^ {
 
-      case tableName ~ tableColumns ~ keySeq ~ tableNameSpace ~ hbaseTableName ~ mappingInfo =>
+      case tableName ~ tableColumns ~ keySeq ~ tableNameSpace ~
+        hbaseTableName ~ mappingInfo ~ splitFileName =>
         // Since the lexical can not recognize the symbol "=" as we expected, we compose it
         // to expression first and then translate it into Map[String, (String, String)].
         // TODO: Now get the info by hacking, need to change it into normal way if possible
@@ -157,16 +160,22 @@ class HBaseSQLParser extends SqlParser {
             .reduceLeft(_ + ";" + _)
         }
 
-        val opts: Map[String, String] = Seq(
+        val opts: Seq[(String, String)] = Seq(
           ("tableName", tableName),
           ("namespace", customizedNameSpace),
           ("hbaseTableName", hbaseTableName),
           ("colsSeq", colsSeqString),
           ("keyCols", keyColsString),
           ("nonKeyCols", nonkeyColsString)
-        ).toMap
-
-        CreateTable(tableName, "org.apache.spark.sql.hbase.HBaseSource", opts)
+        )
+        val addedOpts = {
+          if(splitFileName != None) {
+            opts ++ Seq(("splitFileName", splitFileName.get.value.toString))
+          } else {
+            opts
+          }
+        }
+        CreateTable(tableName, "org.apache.spark.sql.hbase.HBaseSource", addedOpts.toMap)
     }
 
   private[hbase] case class CreateTable(
