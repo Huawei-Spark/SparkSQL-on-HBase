@@ -127,6 +127,21 @@ object HBaseKVHelper {
   }
 
   /**
+   * Takes a record, translate it into HBase row key column matching with metadata
+   * @param values record that as a sequence of string
+   * @param keyBytes  output parameter, array of (key column and its type);
+   */
+  def string2Key(values: Seq[String],
+                lineBuffer: Array[BytesUtils],
+                keyColumns: Seq[AbstractColumn],
+                keyBytes: Array[(Array[Byte], DataType)]) = {
+    values.zipWithIndex.map(kc => {
+      keyBytes(kc._2) = (string2Bytes(values(kc._2), lineBuffer(kc._2)),
+        keyColumns(kc._2).dataType)
+    })
+  }
+
+  /**
    * create a array of buffer that to be used for creating HBase Put object
    * @param schema the schema of the line buffer
    * @return
