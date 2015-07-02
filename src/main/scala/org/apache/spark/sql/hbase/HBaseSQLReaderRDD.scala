@@ -22,10 +22,10 @@ import org.apache.spark._
 import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.catalyst.expressions._
 import org.apache.spark.sql.catalyst.expressions.codegen.GeneratePredicate
-import org.apache.spark.sql.execution.{SparkPlan, SparkSqlSerializer}
+import org.apache.spark.sql.execution.SparkPlan
 import org.apache.spark.sql.hbase.execution.HBaseSQLTableScan
 import org.apache.spark.sql.hbase.util.{BytesUtils, DataTypeUtils, HBaseKVHelper}
-import org.apache.spark.sql.types.{DataType, NativeType}
+import org.apache.spark.sql.types.{AtomicType, DataType}
 import org.apache.spark.sql.{Row, SQLContext}
 
 import scala.collection.mutable.{ArrayBuffer, ListBuffer}
@@ -42,6 +42,7 @@ object CoprocessorConstants {
 class HBasePostCoprocessorSQLReaderRDD(
                                         val relation: HBaseRelation,
                                         val codegenEnabled: Boolean,
+                                        val useCustomFilter: Boolean,
                                         val output: Seq[Attribute],
                                         @transient val filterPred: Option[Expression],
                                         val subplan: SparkPlan,
@@ -77,7 +78,7 @@ class HBasePostCoprocessorSQLReaderRDD(
    */
   private def constructRowKey(cpr: MDCriticalPointRange[_], isStart: Boolean): HBaseRawType = {
     val prefix = cpr.prefix
-    val head: Seq[(HBaseRawType, NativeType)] = prefix.map {
+    val head: Seq[(HBaseRawType, AtomicType)] = prefix.map {
       case (itemValue, itemType) =>
         (DataTypeUtils.dataToBytes(itemValue, itemType), itemType)
     }
@@ -85,7 +86,7 @@ class HBasePostCoprocessorSQLReaderRDD(
     val key = if (isStart) cpr.lastRange.start else cpr.lastRange.end
     val keyType = cpr.lastRange.dt
     val list = if (key.isDefined) {
-      val tail: (HBaseRawType, NativeType) = {
+      val tail: (HBaseRawType, AtomicType) = {
         (DataTypeUtils.dataToBytes(key.get, keyType), keyType)
       }
       head :+ tail
@@ -164,10 +165,8 @@ class HBasePostCoprocessorSQLReaderRDD(
 
     scan.setAttribute(CoprocessorConstants.COINDEX,
         Bytes.toBytes(partitionIndex))
-    scan.setAttribute(CoprocessorConstants.COTYPE,
-        SparkSqlSerializer.serialize[Seq[DataType]](outputDataType))
-    scan.setAttribute(CoprocessorConstants.COKEY,
-      SparkSqlSerializer.serialize[RDD[Row]](newSubplanRDD))
+    scan.setAttribute(CoprocessorConstants.COTYPE, HBaseSerializer.serialize(outputDataType))
+    scan.setAttribute(CoprocessorConstants.COKEY, HBaseSerializer.serialize(newSubplanRDD))
   }
 
   // For critical-point-based predicate pushdown
@@ -179,7 +178,7 @@ class HBasePostCoprocessorSQLReaderRDD(
     val predicate = partition.computePredicate(relation)
     val expandedCPRs: Seq[MDCriticalPointRange[_]] =
       RangeCriticalPoint.generateCriticalPointRanges(relation, predicate).
-        flatMap(_.flatten(new ArrayBuffer[(Any, NativeType)](relation.dimSize)))
+        flatMap(_.flatten(new ArrayBuffer[(Any, AtomicType)](relation.dimSize)))
 
     if (expandedCPRs.isEmpty) {
       val (filters, otherFilters, pushdownPreds) = relation.buildPushdownFilterList(predicate)
@@ -189,7 +188,7 @@ class HBasePostCoprocessorSQLReaderRDD(
         ListBuffer[Expression]()
       }
       val scan = relation.buildScan(partition.start, partition.end, predicate, filters,
-        otherFilters, pushablePreds, output)
+        otherFilters, pushablePreds, useCustomFilter, output)
       setCoprocessor(scan, otherFilters, split.index)
       val scanner = relation.htable.getScanner(scan)
       createIterator(context, scanner, None)
@@ -278,10 +277,16 @@ class HBasePostCoprocessorSQLReaderRDD(
 
         val (filters, otherFilters, preds) =
           relation.buildCPRFilterList(output, predicate, expandedCPRs)
-        val scan = relation.buildScan(start, end, predicate, filters, otherFilters, preds, output)
+        val scan = relation.buildScan(start, end, predicate, filters,
+          otherFilters, preds, useCustomFilter, output)
         setCoprocessor(scan, otherFilters, split.index)
         val scanner = relation.htable.getScanner(scan)
-        createIterator(context, scanner, None)
+        if (useCustomFilter) {
+          // other filters will be evaluated as part of a custom filter
+          createIterator(context, scanner, None)
+        } else {
+          createIterator(context, scanner, otherFilters)
+        }
       }
     }
   }
@@ -293,6 +298,7 @@ class HBasePostCoprocessorSQLReaderRDD(
 class HBaseSQLReaderRDD(
                          val relation: HBaseRelation,
                          val codegenEnabled: Boolean,
+                         val useCustomFilter: Boolean,
                          val output: Seq[Attribute],
                          val deploySuccessfully: Option[Boolean],
                          @transient val filterPred: Option[Expression],
@@ -325,9 +331,9 @@ class HBaseSQLReaderRDD(
 
     val otherFilter: (Row) => Boolean = if (otherFilters.isDefined) {
       if (codegenEnabled) {
-        GeneratePredicate(otherFilters.get, finalOutput)
+        GeneratePredicate.generate(otherFilters.get, finalOutput)
       } else {
-        InterpretedPredicate(otherFilters.get, finalOutput)
+        InterpretedPredicate.create(otherFilters.get, finalOutput)
       }
     } else null
 
@@ -379,7 +385,7 @@ class HBaseSQLReaderRDD(
    */
   private def constructRowKey(cpr: MDCriticalPointRange[_], isStart: Boolean): HBaseRawType = {
     val prefix = cpr.prefix
-    val head: Seq[(HBaseRawType, NativeType)] = prefix.map {
+    val head: Seq[(HBaseRawType, AtomicType)] = prefix.map {
       case (itemValue, itemType) =>
         (DataTypeUtils.dataToBytes(itemValue, itemType), itemType)
     }
@@ -387,7 +393,7 @@ class HBaseSQLReaderRDD(
     val key = if (isStart) cpr.lastRange.start else cpr.lastRange.end
     val keyType = cpr.lastRange.dt
     val list = if (key.isDefined) {
-      val tail: (HBaseRawType, NativeType) = {
+      val tail: (HBaseRawType, AtomicType) = {
         (DataTypeUtils.dataToBytes(key.get, keyType), keyType)
       }
       head :+ tail
@@ -411,7 +417,7 @@ class HBaseSQLReaderRDD(
     val predicate = partition.computePredicate(relation)
     val expandedCPRs: Seq[MDCriticalPointRange[_]] =
       RangeCriticalPoint.generateCriticalPointRanges(relation, predicate).
-        flatMap(_.flatten(new ArrayBuffer[(Any, NativeType)](relation.dimSize)))
+        flatMap(_.flatten(new ArrayBuffer[(Any, AtomicType)](relation.dimSize)))
 
     if (expandedCPRs.isEmpty) {
       val (filters, otherFilters, pushdownPreds) = relation.buildPushdownFilterList(predicate)
@@ -421,10 +427,10 @@ class HBaseSQLReaderRDD(
         ListBuffer[Expression]()
       }
       val scan = relation.buildScan(partition.start, partition.end, predicate, filters,
-        otherFilters, pushablePreds, output)
+        otherFilters, pushablePreds, useCustomFilter, output)
       val scanner = relation.htable.getScanner(scan)
 
-      if (deploySuccessfully.isDefined && deploySuccessfully.get) {
+      if (useCustomFilter && deploySuccessfully.isDefined && deploySuccessfully.get) {
         createIterator(context, scanner, None)
       } else {
         createIterator(context, scanner, otherFilters)
@@ -514,9 +520,11 @@ class HBaseSQLReaderRDD(
 
         val (filters, otherFilters, preds) =
           relation.buildCPRFilterList(output, predicate, expandedCPRs)
-        val scan = relation.buildScan(start, end, predicate, filters, otherFilters, preds, output)
+        val scan = relation.buildScan(start, end, predicate, filters,
+          otherFilters, preds, useCustomFilter, output)
         val scanner = relation.htable.getScanner(scan)
-        if (deploySuccessfully.isDefined && deploySuccessfully.get) {
+        if (useCustomFilter && deploySuccessfully.isDefined && deploySuccessfully.get) {
+          // other filters will be evaluated as part of a custom filter
           createIterator(context, scanner, None)
         } else {
           createIterator(context, scanner, otherFilters)
